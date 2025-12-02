@@ -5,22 +5,18 @@ import NodeCache from "node-cache";
 import fetch from "node-fetch";
 
 dotenv.config();
+
 const app = express();
 app.use(cors());
 
 const API_BASE = "https://v3.football.api-sports.io";
 
-
-function getCurrentSeason() {
-  const now = new Date();
-  return now.getMonth() >= 7 ? now.getFullYear() : now.getFullYear() - 1;
-}
 const DEFAULT_LEAGUE = 39;
-const DEFAULT_SEASON = getCurrentSeason();
+const DEFAULT_SEASON = 2023;
 
 const cache = new NodeCache({
   stdTTL: 300,
-  checkperiod: 120
+  checkperiod: 120,
 });
 
 function safeNumber(val, fallback = 0) {
@@ -41,8 +37,11 @@ function poissonSample(lambda) {
 }
 
 function simulateMatch(lambdaA, lambdaB, sims = 8000) {
-  let aWins = 0, bWins = 0, draws = 0;
-  let sumA = 0, sumB = 0;
+  let aWins = 0;
+  let bWins = 0;
+  let draws = 0;
+  let sumA = 0;
+  let sumB = 0;
   const scoreCounts = new Map();
 
   for (let i = 0; i < sims; i++) {
@@ -60,12 +59,12 @@ function simulateMatch(lambdaA, lambdaB, sims = 8000) {
     scoreCounts.set(key, (scoreCounts.get(key) || 0) + 1);
   }
 
-  const topScorelines = [...scoreCounts]
+  const topScorelines = [...scoreCounts.entries()]
     .sort((a, b) => b[1] - a[1])
     .slice(0, 7)
     .map(([score, count]) => ({
       score,
-      probability: (count / sims) * 100
+      probability: (count / sims) * 100,
     }));
 
   return {
@@ -74,20 +73,30 @@ function simulateMatch(lambdaA, lambdaB, sims = 8000) {
     draw: (draws / sims) * 100,
     avgGoalsA: sumA / sims,
     avgGoalsB: sumB / sims,
-    topScorelines
+    topScorelines,
   };
 }
 
 async function apiCall(url) {
   const key = process.env.API_FOOTBALL_KEY;
-  if (!key) throw new Error("Missing API_FOOTBALL_KEY");
+  if (!key) throw new Error("Missing API_FOOTBALL_KEY in environment");
 
-  const resp = await fetch(url, { headers: { "x-apisports-key": key } });
+  const resp = await fetch(url, {
+    headers: { "x-apisports-key": key },
+  });
+
   const data = await resp.json();
-  
+
+  if (!resp.ok) {
+    throw new Error(
+      `HTTP ${resp.status}: ${JSON.stringify(data.errors || data)}`
+    );
+  }
+
   if (data.errors && Object.keys(data.errors).length > 0) {
     throw new Error(JSON.stringify(data.errors));
   }
+
   return data;
 }
 
@@ -102,26 +111,14 @@ async function cachedFetch(cacheKey, ttlSec, builder) {
 
 async function getTeamList() {
   return cachedFetch(
-    "teams",
+    `teams_${DEFAULT_LEAGUE}_${DEFAULT_SEASON}`,
     21600,
-    () => apiCall(`${API_BASE}/teams?league=${DEFAULT_LEAGUE}&season=${DEFAULT_SEASON}`)
+    () =>
+      apiCall(
+        `${API_BASE}/teams?league=${DEFAULT_LEAGUE}&season=${DEFAULT_SEASON}`
+      )
   );
 }
-
-app.get("/fixtures", async (req, res) => {
-  try {
-    const fixtures = await cachedFetch(
-      "fixtures",
-      300,
-      () =>
-        apiCall(`${API_BASE}/fixtures?league=${DEFAULT_LEAGUE}&season=${DEFAULT_SEASON}&next=50`)
-    );
-
-    res.json({ fixtures: fixtures.response });
-  } catch (err) {
-    res.status(500).json({ error: "Could not load fixtures", details: err.message });
-  }
-});
 
 function buildXG(statsA, statsB, marketTotal) {
   const A = statsA.response;
@@ -143,8 +140,8 @@ function buildXG(statsA, statsB, marketTotal) {
   const baseTotal = lambdaA_raw + lambdaB_raw;
 
   let targetTotal;
-  if (marketTotal && !isNaN(marketTotal)) {
-    targetTotal = parseFloat(marketTotal);
+  if (marketTotal && !Number.isNaN(Number(marketTotal))) {
+    targetTotal = Number(marketTotal);
   } else {
     const totalA =
       safeNumber(A.goals.for.average.total) +
@@ -155,22 +152,24 @@ function buildXG(statsA, statsB, marketTotal) {
     targetTotal = (totalA + totalB) / 2;
   }
 
-  const scale = Math.max(0.4, Math.min(targetTotal / baseTotal, 2.5));
+  const scale = Math.max(0.4, Math.min(targetTotal / baseTotal || 1, 2.5));
 
   return {
     lambdaA: lambdaA_raw * scale,
-    lambdaB: lambdaB_raw * scale
+    lambdaB: lambdaB_raw * scale,
   };
 }
 
 app.get("/predict", async (req, res) => {
   try {
     const { teamAName, teamBName, marketTotal } = req.query;
+
     if (!teamAName || !teamBName) {
       return res.status(400).json({ error: "Missing team names" });
     }
 
     const teams = await getTeamList();
+
     const teamA = teams.response.find(
       (t) => t.team.name.toLowerCase() === teamAName.toLowerCase()
     );
@@ -179,11 +178,13 @@ app.get("/predict", async (req, res) => {
     );
 
     if (!teamA || !teamB) {
-      return res.status(404).json({ error: "Team not found in current season" });
+      return res
+        .status(404)
+        .json({ error: "Team not found in the current season." });
     }
 
     const statsA = await cachedFetch(
-      `stats_${teamA.team.id}`,
+      `stats_${teamA.team.id}_${DEFAULT_SEASON}`,
       3600,
       () =>
         apiCall(
@@ -192,7 +193,7 @@ app.get("/predict", async (req, res) => {
     );
 
     const statsB = await cachedFetch(
-      `stats_${teamB.team.id}`,
+      `stats_${teamB.team.id}_${DEFAULT_SEASON}`,
       3600,
       () =>
         apiCall(
@@ -201,7 +202,7 @@ app.get("/predict", async (req, res) => {
     );
 
     const playersA = await cachedFetch(
-      `players_${teamA.team.id}`,
+      `players_${teamA.team.id}_${DEFAULT_SEASON}`,
       600,
       () =>
         apiCall(
@@ -210,7 +211,7 @@ app.get("/predict", async (req, res) => {
     );
 
     const playersB = await cachedFetch(
-      `players_${teamB.team.id}`,
+      `players_${teamB.team.id}_${DEFAULT_SEASON}`,
       600,
       () =>
         apiCall(
@@ -219,37 +220,63 @@ app.get("/predict", async (req, res) => {
     );
 
     const xg = buildXG(statsA, statsB, marketTotal);
-
     const sim = simulateMatch(xg.lambdaA, xg.lambdaB);
 
-    const topScorersA = playersA.response
-      .filter((p) => p.statistics[0].goals.total > 0)
-      .sort(
-        (a, b) =>
-          b.statistics[0].goals.total - a.statistics[0].goals.total
+    const topScorersA = (playersA.response || [])
+      .filter(
+        (p) =>
+          p.statistics &&
+          p.statistics[0] &&
+          safeNumber(p.statistics[0].goals.total) > 0
       )
+      .map((p) => ({
+        name: p.player.name,
+        position: p.statistics[0].games.position,
+        goals: safeNumber(p.statistics[0].goals.total),
+        appearances: safeNumber(p.statistics[0].games.appearences),
+      }))
+      .sort((a, b) => b.goals - a.goals)
       .slice(0, 3);
 
-    const topScorersB = playersB.response
-      .filter((p) => p.statistics[0].goals.total > 0)
-      .sort(
-        (a, b) =>
-          b.statistics[0].goals.total - a.statistics[0].goals.total
+    const topScorersB = (playersB.response || [])
+      .filter(
+        (p) =>
+          p.statistics &&
+          p.statistics[0] &&
+          safeNumber(p.statistics[0].goals.total) > 0
       )
+      .map((p) => ({
+        name: p.player.name,
+        position: p.statistics[0].games.position,
+        goals: safeNumber(p.statistics[0].goals.total),
+        appearances: safeNumber(p.statistics[0].games.appearences),
+      }))
+      .sort((a, b) => b.goals - a.goals)
       .slice(0, 3);
 
     res.json({
       teamA: { name: teamAName, id: teamA.team.id },
       teamB: { name: teamBName, id: teamB.team.id },
-      xg,
-      sim,
+      model: {
+        lambdaA: xg.lambdaA,
+        lambdaB: xg.lambdaB
+      },
+      simulation: {
+        winA: sim.winA,
+        winB: sim.winB,
+        draw: sim.draw,
+        topScorelines: sim.topScorelines
+      },
       topScorersA,
-      topScorersB
+      topScorersB,
     });
-
   } catch (err) {
+    console.error("Prediction route error:", err.message);
     res.status(500).json({ error: "Prediction error", details: err.message });
   }
 });
 
-app.listen(3000, () => console.log("Server running on port 3000"));
+app.listen(3000, () => {
+  console.log("Server running on port 3000");
+  console.log("Using League:", DEFAULT_LEAGUE, "Season:", DEFAULT_SEASON);
+});
