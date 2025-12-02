@@ -21,6 +21,14 @@ See the section about [running tests](https://facebook.github.io/create-react-ap
 
 ### `npm run build`
 
+Also need to run the following which were added for cache:
+
+### `npm install node-cache`
+
+### `npm install node-fetch`
+
+Cache lasts for 6 hours before expiring/being overwritten
+
 Builds the app for production to the `build` folder.\
 It correctly bundles React in production mode and optimizes the build for the best performance.
 
