@@ -1,28 +1,31 @@
 import express from "express";
 import dotenv from "dotenv";
 import cors from "cors";
+import NodeCache from "node-cache";
+import fetch from "node-fetch";
 
 dotenv.config();
 const app = express();
-const PORT = 3000;
-
 app.use(cors());
 
 const API_BASE = "https://v3.football.api-sports.io";
-const DEFAULT_LEAGUE = 39;
-const DEFAULT_SEASON = 2023;
 
-function getTeamIdByName(name, teamsData) {
-  if (!teamsData || !Array.isArray(teamsData.response)) return null;
-  const teamObj = teamsData.response.find(
-    (item) => item.team.name.toLowerCase() === name.toLowerCase()
-  );
-  return teamObj ? teamObj.team.id : null;
+
+function getCurrentSeason() {
+  const now = new Date();
+  return now.getMonth() >= 7 ? now.getFullYear() : now.getFullYear() - 1;
 }
+const DEFAULT_LEAGUE = 39;
+const DEFAULT_SEASON = getCurrentSeason();
 
-function safeNumber(value, fallback = 0) {
-  if (value === null || value === undefined) return fallback;
-  const n = typeof value === "string" ? parseFloat(value) : value;
+const cache = new NodeCache({
+  stdTTL: 300,
+  checkperiod: 120
+});
+
+function safeNumber(val, fallback = 0) {
+  if (val === undefined || val === null) return fallback;
+  const n = parseFloat(val);
   return Number.isFinite(n) ? n : fallback;
 }
 
@@ -31,23 +34,21 @@ function poissonSample(lambda) {
   let p = 1.0;
   let k = 0;
   while (p > L) {
-    k++;
     p *= Math.random();
+    k++;
   }
   return k - 1;
 }
 
-function simulateMatch(lambdaA, lambdaB, simulations = 8000) {
-  let aWins = 0;
-  let bWins = 0;
-  let draws = 0;
-  let sumA = 0;
-  let sumB = 0;
+function simulateMatch(lambdaA, lambdaB, sims = 8000) {
+  let aWins = 0, bWins = 0, draws = 0;
+  let sumA = 0, sumB = 0;
   const scoreCounts = new Map();
 
-  for (let i = 0; i < simulations; i++) {
+  for (let i = 0; i < sims; i++) {
     const gA = poissonSample(lambdaA);
     const gB = poissonSample(lambdaB);
+
     sumA += gA;
     sumB += gB;
 
@@ -59,267 +60,196 @@ function simulateMatch(lambdaA, lambdaB, simulations = 8000) {
     scoreCounts.set(key, (scoreCounts.get(key) || 0) + 1);
   }
 
-  const topScorelines = Array.from(scoreCounts.entries())
+  const topScorelines = [...scoreCounts]
     .sort((a, b) => b[1] - a[1])
     .slice(0, 7)
     .map(([score, count]) => ({
       score,
-      probability: (count / simulations) * 100,
+      probability: (count / sims) * 100
     }));
 
   return {
-    winA: (aWins / simulations) * 100,
-    winB: (bWins / simulations) * 100,
-    draw: (draws / simulations) * 100,
-    avgGoalsA: sumA / simulations,
-    avgGoalsB: sumB / simulations,
-    topScorelines,
+    winA: (aWins / sims) * 100,
+    winB: (bWins / sims) * 100,
+    draw: (draws / sims) * 100,
+    avgGoalsA: sumA / sims,
+    avgGoalsB: sumB / sims,
+    topScorelines
   };
 }
 
-function buildExpectedGoals(teamStatsA, teamStatsB, marketTotal) {
-  const A = teamStatsA.response;
-  const B = teamStatsB.response;
+async function apiCall(url) {
+  const key = process.env.API_FOOTBALL_KEY;
+  if (!key) throw new Error("Missing API_FOOTBALL_KEY");
 
-  const homeAttackAvg =
-    safeNumber(A.goals?.for?.average?.home) ||
-    safeNumber(A.goals?.for?.average?.total);
-  const awayAttackAvg =
-    safeNumber(B.goals?.for?.average?.away) ||
-    safeNumber(B.goals?.for?.average?.total);
-
-  const homeDefenceHomeConceded =
-    safeNumber(A.goals?.against?.average?.home) ||
-    safeNumber(A.goals?.against?.average?.total);
-  const awayDefenceAwayConceded =
-    safeNumber(B.goals?.against?.average?.away) ||
-    safeNumber(B.goals?.against?.average?.total);
-
-  let lambdaA_raw =
-    1.1 * (0.7 * homeAttackAvg + 0.3 * awayDefenceAwayConceded); 
-  let lambdaB_raw =
-    0.9 * (0.7 * awayAttackAvg + 0.3 * homeDefenceHomeConceded); 
-
-  lambdaA_raw = Math.max(0.05, Math.min(lambdaA_raw, 4.5));
-  lambdaB_raw = Math.max(0.05, Math.min(lambdaB_raw, 4.5));
-
-  const avgTotalA =
-    safeNumber(A.goals?.for?.average?.total) +
-    safeNumber(A.goals?.against?.average?.total);
-  const avgTotalB =
-    safeNumber(B.goals?.for?.average?.total) +
-    safeNumber(B.goals?.against?.average?.total);
-  let historicalMatchTotal = (avgTotalA + avgTotalB) / 2;
-
-  if (!Number.isFinite(historicalMatchTotal) || historicalMatchTotal <= 0) {
-    historicalMatchTotal = lambdaA_raw + lambdaB_raw;
+  const resp = await fetch(url, { headers: { "x-apisports-key": key } });
+  const data = await resp.json();
+  
+  if (data.errors && Object.keys(data.errors).length > 0) {
+    throw new Error(JSON.stringify(data.errors));
   }
-
-  const baseTotal = lambdaA_raw + lambdaB_raw || 0.1;
-  let targetTotal = historicalMatchTotal;
-
-  if (marketTotal && !Number.isNaN(Number(marketTotal))) {
-    targetTotal = Number(marketTotal);
-  }
-
-  let scaleFactor = targetTotal / baseTotal;
-  scaleFactor = Math.max(0.4, Math.min(scaleFactor, 2.5));
-
-  const lambdaA = lambdaA_raw * scaleFactor;
-  const lambdaB = lambdaB_raw * scaleFactor;
-
-  return {
-    lambdaA,
-    lambdaB,
-    lambdaA_raw,
-    lambdaB_raw,
-    baseTotal,
-    targetTotal,
-    scaleFactor,
-  };
+  return data;
 }
 
-function computeTopScorers(playersData, teamStats, teamExpectedGoals, limit = 3) {
-  if (!playersData || !Array.isArray(playersData.response)) return [];
-  const totalTeamGoals = safeNumber(teamStats.response.goals?.for?.total?.total);
-  if (totalTeamGoals <= 0 || teamExpectedGoals <= 0) return [];
+async function cachedFetch(cacheKey, ttlSec, builder) {
+  const existing = cache.get(cacheKey);
+  if (existing) return existing;
 
-  const players = [];
+  const data = await builder();
+  cache.set(cacheKey, data, ttlSec);
+  return data;
+}
 
-  for (const item of playersData.response) {
-    const player = item.player;
-    const stats = Array.isArray(item.statistics) ? item.statistics[0] : null;
-    if (!stats) continue;
-
-    const goals = safeNumber(stats.goals?.total);
-    const appearances = safeNumber(stats.games?.appearences, 0);
-    if (goals <= 0 || appearances <= 0) continue;
-
-    const share = goals / totalTeamGoals;
-    const lambdaPlayer = teamExpectedGoals * share;
-    const prob = 1 - Math.exp(-lambdaPlayer);
-
-    players.push({
-      name: player?.name || "Unknown",
-      position: stats.games?.position || "N/A",
-      goals,
-      appearances,
-      probability: prob * 100,
-    });
-  }
-
-  return players
-    .sort((a, b) => b.probability - a.probability)
-    .slice(0, limit);
+async function getTeamList() {
+  return cachedFetch(
+    "teams",
+    21600,
+    () => apiCall(`${API_BASE}/teams?league=${DEFAULT_LEAGUE}&season=${DEFAULT_SEASON}`)
+  );
 }
 
 app.get("/fixtures", async (req, res) => {
   try {
-    const apiKey = process.env.API_FOOTBALL_KEY;
-    if (!apiKey) {
-      return res.status(500).json({ error: "Missing API_FOOTBALL_KEY in .env" });
-    }
-
-    const league = req.query.league || DEFAULT_LEAGUE;
-    const season = req.query.season || DEFAULT_SEASON;
-    const next = req.query.next || 50;
-
-    const resp = await fetch(
-      `${API_BASE}/fixtures?league=${league}&season=${season}&next=${next}`,
-      {
-        headers: { "x-apisports-key": apiKey },
-      }
+    const fixtures = await cachedFetch(
+      "fixtures",
+      300,
+      () =>
+        apiCall(`${API_BASE}/fixtures?league=${DEFAULT_LEAGUE}&season=${DEFAULT_SEASON}&next=50`)
     );
-    const data = await resp.json();
 
-    if (data.errors && Object.keys(data.errors).length > 0) {
-      return res
-        .status(400)
-        .json({ error: "API error", details: data.errors });
-    }
-
-    const fixtures = (data.response || []).map((f) => ({
-      id: f.fixture?.id,
-      date: f.fixture?.date,
-      timestamp: f.fixture?.timestamp,
-      status: f.fixture?.status?.short,
-      venue: f.fixture?.venue?.name,
-      homeTeam: f.teams?.home?.name,
-      awayTeam: f.teams?.away?.name,
-      league: data.parameters?.league,
-      season: data.parameters?.season,
-    }));
-
-    res.json({ fixtures });
+    res.json({ fixtures: fixtures.response });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "API error", details: err.message });
+    res.status(500).json({ error: "Could not load fixtures", details: err.message });
   }
 });
+
+function buildXG(statsA, statsB, marketTotal) {
+  const A = statsA.response;
+  const B = statsB.response;
+
+  let lambdaA_raw =
+    1.1 *
+    (0.7 * safeNumber(A.goals.for.average.home) +
+      0.3 * safeNumber(B.goals.against.average.away));
+
+  let lambdaB_raw =
+    0.9 *
+    (0.7 * safeNumber(B.goals.for.average.away) +
+      0.3 * safeNumber(A.goals.against.average.home));
+
+  lambdaA_raw = Math.max(0.05, Math.min(lambdaA_raw, 4.5));
+  lambdaB_raw = Math.max(0.05, Math.min(lambdaB_raw, 4.5));
+
+  const baseTotal = lambdaA_raw + lambdaB_raw;
+
+  let targetTotal;
+  if (marketTotal && !isNaN(marketTotal)) {
+    targetTotal = parseFloat(marketTotal);
+  } else {
+    const totalA =
+      safeNumber(A.goals.for.average.total) +
+      safeNumber(A.goals.against.average.total);
+    const totalB =
+      safeNumber(B.goals.for.average.total) +
+      safeNumber(B.goals.against.average.total);
+    targetTotal = (totalA + totalB) / 2;
+  }
+
+  const scale = Math.max(0.4, Math.min(targetTotal / baseTotal, 2.5));
+
+  return {
+    lambdaA: lambdaA_raw * scale,
+    lambdaB: lambdaB_raw * scale
+  };
+}
 
 app.get("/predict", async (req, res) => {
   try {
-    const apiKey = process.env.API_FOOTBALL_KEY;
-    if (!apiKey) {
-      return res.status(500).json({ error: "Missing API_FOOTBALL_KEY in .env" });
-    }
-
     const { teamAName, teamBName, marketTotal } = req.query;
-
     if (!teamAName || !teamBName) {
-      return res
-        .status(400)
-        .json({ error: "teamAName and teamBName are required" });
+      return res.status(400).json({ error: "Missing team names" });
     }
 
-    const leaguesResp = await fetch(
-      `${API_BASE}/teams?league=${DEFAULT_LEAGUE}&season=${DEFAULT_SEASON}`,
-      {
-        headers: { "x-apisports-key": apiKey },
-      }
+    const teams = await getTeamList();
+    const teamA = teams.response.find(
+      (t) => t.team.name.toLowerCase() === teamAName.toLowerCase()
     );
-    const teamsData = await leaguesResp.json();
+    const teamB = teams.response.find(
+      (t) => t.team.name.toLowerCase() === teamBName.toLowerCase()
+    );
 
-    const teamAId = getTeamIdByName(teamAName, teamsData);
-    const teamBId = getTeamIdByName(teamBName, teamsData);
-
-    if (!teamAId || !teamBId) {
-      return res.status(404).json({
-        error: "Team not found in API for current league/season",
-        details: { teamAId, teamBId },
-      });
+    if (!teamA || !teamB) {
+      return res.status(404).json({ error: "Team not found in current season" });
     }
 
-    const [statsAResp, statsBResp] = await Promise.all([
-      fetch(
-        `${API_BASE}/teams/statistics?team=${teamAId}&season=${DEFAULT_SEASON}&league=${DEFAULT_LEAGUE}`,
-        { headers: { "x-apisports-key": apiKey } }
-      ),
-      fetch(
-        `${API_BASE}/teams/statistics?team=${teamBId}&season=${DEFAULT_SEASON}&league=${DEFAULT_LEAGUE}`,
-        { headers: { "x-apisports-key": apiKey } }
-      ),
-    ]);
-
-    const [statsA, statsB] = await Promise.all([
-      statsAResp.json(),
-      statsBResp.json(),
-    ]);
-
-    const xgModel = buildExpectedGoals(statsA, statsB, marketTotal);
-    const simulation = simulateMatch(xgModel.lambdaA, xgModel.lambdaB, 8000);
-
-    const [playersAResp, playersBResp] = await Promise.all([
-      fetch(
-        `${API_BASE}/players?team=${teamAId}&season=${DEFAULT_SEASON}`,
-        { headers: { "x-apisports-key": apiKey } }
-      ),
-      fetch(
-        `${API_BASE}/players?team=${teamBId}&season=${DEFAULT_SEASON}`,
-        { headers: { "x-apisports-key": apiKey } }
-      ),
-    ]);
-
-    const [playersA, playersB] = await Promise.all([
-      playersAResp.json(),
-      playersBResp.json(),
-    ]);
-
-    const topScorersA = computeTopScorers(
-      playersA,
-      statsA,
-      xgModel.lambdaA,
-      3
+    const statsA = await cachedFetch(
+      `stats_${teamA.team.id}`,
+      3600,
+      () =>
+        apiCall(
+          `${API_BASE}/teams/statistics?team=${teamA.team.id}&season=${DEFAULT_SEASON}&league=${DEFAULT_LEAGUE}`
+        )
     );
-    const topScorersB = computeTopScorers(
-      playersB,
-      statsB,
-      xgModel.lambdaB,
-      3
+
+    const statsB = await cachedFetch(
+      `stats_${teamB.team.id}`,
+      3600,
+      () =>
+        apiCall(
+          `${API_BASE}/teams/statistics?team=${teamB.team.id}&season=${DEFAULT_SEASON}&league=${DEFAULT_LEAGUE}`
+        )
     );
+
+    const playersA = await cachedFetch(
+      `players_${teamA.team.id}`,
+      600,
+      () =>
+        apiCall(
+          `${API_BASE}/players?team=${teamA.team.id}&season=${DEFAULT_SEASON}`
+        )
+    );
+
+    const playersB = await cachedFetch(
+      `players_${teamB.team.id}`,
+      600,
+      () =>
+        apiCall(
+          `${API_BASE}/players?team=${teamB.team.id}&season=${DEFAULT_SEASON}`
+        )
+    );
+
+    const xg = buildXG(statsA, statsB, marketTotal);
+
+    const sim = simulateMatch(xg.lambdaA, xg.lambdaB);
+
+    const topScorersA = playersA.response
+      .filter((p) => p.statistics[0].goals.total > 0)
+      .sort(
+        (a, b) =>
+          b.statistics[0].goals.total - a.statistics[0].goals.total
+      )
+      .slice(0, 3);
+
+    const topScorersB = playersB.response
+      .filter((p) => p.statistics[0].goals.total > 0)
+      .sort(
+        (a, b) =>
+          b.statistics[0].goals.total - a.statistics[0].goals.total
+      )
+      .slice(0, 3);
 
     res.json({
-      teamA: {
-        name: teamAName,
-        id: teamAId,
-        stats: statsA,
-      },
-      teamB: {
-        name: teamBName,
-        id: teamBId,
-        stats: statsB,
-      },
-      model: xgModel,
-      simulation,
+      teamA: { name: teamAName, id: teamA.team.id },
+      teamB: { name: teamBName, id: teamB.team.id },
+      xg,
+      sim,
       topScorersA,
-      topScorersB,
+      topScorersB
     });
+
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "API error", details: err.message });
+    res.status(500).json({ error: "Prediction error", details: err.message });
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
+app.listen(3000, () => console.log("Server running on port 3000"));
